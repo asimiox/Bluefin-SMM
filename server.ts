@@ -1,3 +1,4 @@
+import "dotenv/config";
 import express from "express";
 import { createServer as createViteServer } from "vite";
 import Database from "better-sqlite3";
@@ -6,7 +7,7 @@ import axios from "axios";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 
-const db = new Database("smm.db");
+const db = new Database(process.env.NODE_ENV === 'production' ? '/tmp/smm.db' : 'smm.db');
 const JWT_SECRET = process.env.JWT_SECRET || "smm-secret-key-123";
 
 // Initialize Database
@@ -76,29 +77,38 @@ db.exec(`
 
 // Seed default users
 async function seedUsers() {
-  const adminExists = db.prepare("SELECT * FROM users WHERE role = 'admin'").get();
-  if (!adminExists) {
-    const hashedPassword = await bcrypt.hash("adminpassword", 10);
-    db.prepare("INSERT INTO users (username, email, password, role, balance) VALUES (?, ?, ?, ?, ?)")
-      .run("admin", "admin@smm.com", hashedPassword, "admin", 1000);
-    console.log("Admin user seeded: admin@smm.com / adminpassword");
-  }
+  try {
+    const adminExists = db.prepare("SELECT * FROM users WHERE role = 'admin'").get();
+    if (!adminExists) {
+      const hashedPassword = await bcrypt.hash("adminpassword", 10);
+      db.prepare("INSERT INTO users (username, email, password, role, balance) VALUES (?, ?, ?, ?, ?)")
+        .run("admin", "admin@smm.com", hashedPassword, "admin", 1000);
+      console.log("Admin user seeded: admin@smm.com / adminpassword");
+    }
 
-  const userExists = db.prepare("SELECT * FROM users WHERE username = 'user'").get();
-  if (!userExists) {
-    const hashedPassword = await bcrypt.hash("userpassword", 10);
-    db.prepare("INSERT INTO users (username, email, password, role, balance) VALUES (?, ?, ?, ?, ?)")
-      .run("user", "user@smm.com", hashedPassword, "user", 100);
-    console.log("Normal user seeded: user@smm.com / userpassword");
+    const userExists = db.prepare("SELECT * FROM users WHERE username = 'user'").get();
+    if (!userExists) {
+      const hashedPassword = await bcrypt.hash("userpassword", 10);
+      db.prepare("INSERT INTO users (username, email, password, role, balance) VALUES (?, ?, ?, ?, ?)")
+        .run("user", "user@smm.com", hashedPassword, "user", 100);
+      console.log("Normal user seeded: user@smm.com / userpassword");
+    }
+  } catch (err: any) {
+    console.error("Seeding failed (this is expected if DB is read-only):", err.message);
   }
 }
 
-seedUsers();
+const app = express();
+app.use(express.json());
 
 async function startServer() {
-  const app = express();
-  app.use(express.json());
+  await seedUsers();
   const PORT = 3000;
+
+  // --- Health Check ---
+  app.get("/api/health", (req, res) => {
+    res.json({ status: "ok", env: process.env.NODE_ENV, vercel: !!process.env.VERCEL });
+  });
 
   // --- Auth Routes ---
 
@@ -614,15 +624,23 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    app.use(express.static(path.join(__dirname, "dist")));
+    // In Vercel, static files are handled by vercel.json
+    // But we keep this for other production environments
+    const distPath = path.join(process.cwd(), "dist");
+    app.use(express.static(distPath));
     app.get("*", (req, res) => {
-      res.sendFile(path.join(__dirname, "dist", "index.html"));
+      if (req.path.startsWith('/api')) return;
+      res.sendFile(path.join(distPath, "index.html"));
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://localhost:${PORT}`);
-  });
+  if (process.env.NODE_ENV !== 'production' || !process.env.VERCEL) {
+    app.listen(PORT, "0.0.0.0", () => {
+      console.log(`Server running on http://localhost:${PORT}`);
+    });
+  }
 }
 
 startServer();
+
+export default app;
