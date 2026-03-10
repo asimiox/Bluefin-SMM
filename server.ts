@@ -1,5 +1,6 @@
 import "dotenv/config";
 import express from "express";
+import cors from "cors";
 import { createServer as createViteServer } from "vite";
 import Database from "better-sqlite3";
 import path from "path";
@@ -7,76 +8,88 @@ import axios from "axios";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 
-const db = new Database(process.env.NODE_ENV === 'production' ? '/tmp/smm.db' : 'smm.db');
-const JWT_SECRET = process.env.JWT_SECRET || "smm-secret-key-123";
+const dbPath = process.env.VERCEL ? '/tmp/smm.db' : 'smm.db';
+let db: any;
 
 // Initialize Database
-db.exec(`
-  CREATE TABLE IF NOT EXISTS providers (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    url TEXT NOT NULL,
-    api_key TEXT NOT NULL,
-    margin REAL DEFAULT 0,
-    last_import TEXT
-  );
+function initDb() {
+  try {
+    db = new Database(dbPath);
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS providers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        url TEXT NOT NULL,
+        api_key TEXT NOT NULL,
+        margin REAL DEFAULT 0,
+        last_import TEXT
+      );
 
-  CREATE TABLE IF NOT EXISTS categories (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT UNIQUE NOT NULL
-  );
+      CREATE TABLE IF NOT EXISTS categories (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE NOT NULL
+      );
 
-  CREATE TABLE IF NOT EXISTS services (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    service_id TEXT NOT NULL,
-    provider_id INTEGER NOT NULL,
-    name TEXT NOT NULL,
-    category_id INTEGER NOT NULL,
-    provider_rate REAL NOT NULL,
-    selling_price REAL NOT NULL,
-    min INTEGER,
-    max INTEGER,
-    FOREIGN KEY (provider_id) REFERENCES providers(id),
-    FOREIGN KEY (category_id) REFERENCES categories(id)
-  );
+      CREATE TABLE IF NOT EXISTS services (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        service_id TEXT NOT NULL,
+        provider_id INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        category_id INTEGER NOT NULL,
+        provider_rate REAL NOT NULL,
+        selling_price REAL NOT NULL,
+        min INTEGER,
+        max INTEGER,
+        FOREIGN KEY (provider_id) REFERENCES providers(id),
+        FOREIGN KEY (category_id) REFERENCES categories(id)
+      );
 
-  CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT UNIQUE NOT NULL,
-    email TEXT UNIQUE NOT NULL,
-    password TEXT NOT NULL,
-    balance REAL DEFAULT 0,
-    role TEXT DEFAULT 'user',
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
+      CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        email TEXT UNIQUE NOT NULL,
+        password TEXT NOT NULL,
+        balance REAL DEFAULT 0,
+        role TEXT DEFAULT 'user',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
 
-  CREATE TABLE IF NOT EXISTS orders (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL,
-    service_id INTEGER NOT NULL,
-    provider_order_id TEXT,
-    link TEXT NOT NULL,
-    quantity INTEGER NOT NULL,
-    charge REAL NOT NULL,
-    status TEXT DEFAULT 'pending',
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (user_id) REFERENCES users(id),
-    FOREIGN KEY (service_id) REFERENCES services(id)
-  );
+      CREATE TABLE IF NOT EXISTS orders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        service_id INTEGER NOT NULL,
+        provider_order_id TEXT,
+        link TEXT NOT NULL,
+        quantity INTEGER NOT NULL,
+        charge REAL NOT NULL,
+        status TEXT DEFAULT 'pending',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id),
+        FOREIGN KEY (service_id) REFERENCES services(id)
+      );
 
-  CREATE TABLE IF NOT EXISTS transactions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL,
-    amount REAL NOT NULL,
-    type TEXT NOT NULL, -- 'deposit', 'order'
-    description TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (user_id) REFERENCES users(id)
-  );
-`);
+      CREATE TABLE IF NOT EXISTS transactions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        amount REAL NOT NULL,
+        type TEXT NOT NULL, -- 'deposit', 'order'
+        description TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id)
+      );
+    `);
+    console.log("Database initialized at:", dbPath);
+  } catch (err: any) {
+    console.error("Database initialization failed:", err.message);
+    // If it's read-only, we might still be able to run in some modes
+  }
+}
+
+const JWT_SECRET = process.env.JWT_SECRET || "smm-secret-key-123";
 
 // Seed default users
 async function seedUsers() {
+  if (!db) return;
   try {
     const adminExists = db.prepare("SELECT * FROM users WHERE role = 'admin'").get();
     if (!adminExists) {
@@ -99,9 +112,11 @@ async function seedUsers() {
 }
 
 const app = express();
+app.use(cors());
 app.use(express.json());
 
 async function startServer() {
+  initDb();
   await seedUsers();
   const PORT = 3000;
 
@@ -633,6 +648,12 @@ async function startServer() {
       res.sendFile(path.join(distPath, "index.html"));
     });
   }
+
+  // Error handler
+  app.use((err: any, req: any, res: any, next: any) => {
+    console.error("Express Error:", err);
+    res.status(500).json({ error: "Internal Server Error", details: err.message });
+  });
 
   if (process.env.NODE_ENV !== 'production' || !process.env.VERCEL) {
     app.listen(PORT, "0.0.0.0", () => {
