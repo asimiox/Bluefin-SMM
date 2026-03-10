@@ -2,112 +2,51 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import { createServer as createViteServer } from "vite";
-import Database from "better-sqlite3";
 import path from "path";
 import axios from "axios";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
+import { createClient } from "@supabase/supabase-js";
 
-const dbPath = process.env.VERCEL ? '/tmp/smm.db' : 'smm.db';
-let db: any;
-
-// Initialize Database
-function initDb() {
-  try {
-    db = new Database(dbPath);
-    db.exec(`
-      CREATE TABLE IF NOT EXISTS providers (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL,
-        url TEXT NOT NULL,
-        api_key TEXT NOT NULL,
-        margin REAL DEFAULT 0,
-        last_import TEXT
-      );
-
-      CREATE TABLE IF NOT EXISTS categories (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT UNIQUE NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS services (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        service_id TEXT NOT NULL,
-        provider_id INTEGER NOT NULL,
-        name TEXT NOT NULL,
-        category_id INTEGER NOT NULL,
-        provider_rate REAL NOT NULL,
-        selling_price REAL NOT NULL,
-        min INTEGER,
-        max INTEGER,
-        FOREIGN KEY (provider_id) REFERENCES providers(id),
-        FOREIGN KEY (category_id) REFERENCES categories(id)
-      );
-
-      CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE NOT NULL,
-        email TEXT UNIQUE NOT NULL,
-        password TEXT NOT NULL,
-        balance REAL DEFAULT 0,
-        role TEXT DEFAULT 'user',
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-      );
-
-      CREATE TABLE IF NOT EXISTS orders (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        service_id INTEGER NOT NULL,
-        provider_order_id TEXT,
-        link TEXT NOT NULL,
-        quantity INTEGER NOT NULL,
-        charge REAL NOT NULL,
-        status TEXT DEFAULT 'pending',
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (user_id) REFERENCES users(id),
-        FOREIGN KEY (service_id) REFERENCES services(id)
-      );
-
-      CREATE TABLE IF NOT EXISTS transactions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        amount REAL NOT NULL,
-        type TEXT NOT NULL, -- 'deposit', 'order'
-        description TEXT,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (user_id) REFERENCES users(id)
-      );
-    `);
-    console.log("Database initialized at:", dbPath);
-  } catch (err: any) {
-    console.error("Database initialization failed:", err.message);
-    // If it's read-only, we might still be able to run in some modes
-  }
-}
-
+const SUPABASE_URL = process.env.SUPABASE_URL || "";
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
 const JWT_SECRET = process.env.JWT_SECRET || "smm-secret-key-123";
 
-// Seed default users
-async function seedUsers() {
-  if (!db) return;
-  try {
-    const adminExists = db.prepare("SELECT * FROM users WHERE role = 'admin'").get();
-    if (!adminExists) {
-      const hashedPassword = await bcrypt.hash("adminpassword", 10);
-      db.prepare("INSERT INTO users (username, email, password, role, balance) VALUES (?, ?, ?, ?, ?)")
-        .run("admin", "admin@smm.com", hashedPassword, "admin", 1000);
-      console.log("Admin user seeded: admin@smm.com / adminpassword");
-    }
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
-    const userExists = db.prepare("SELECT * FROM users WHERE username = 'user'").get();
-    if (!userExists) {
-      const hashedPassword = await bcrypt.hash("userpassword", 10);
-      db.prepare("INSERT INTO users (username, email, password, role, balance) VALUES (?, ?, ?, ?, ?)")
-        .run("user", "user@smm.com", hashedPassword, "user", 100);
-      console.log("Normal user seeded: user@smm.com / userpassword");
+// Seed default admin user
+async function seedAdmin() {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) return;
+  
+  try {
+    const { data: admin, error } = await supabase
+      .from("users")
+      .select("id")
+      .eq("role", "admin")
+      .limit(1)
+      .single();
+
+    if (error && error.code === 'PGRST116') { // Record not found
+      console.log("Seeding default admin user...");
+      const hashedPassword = await bcrypt.hash("adminpassword", 10);
+      const { error: insertError } = await supabase
+        .from("users")
+        .insert([{
+          username: "admin",
+          email: "admin@smm.com",
+          password: hashedPassword,
+          role: "admin",
+          balance: 1000
+        }]);
+      
+      if (insertError) {
+        console.error("Failed to seed admin:", insertError.message);
+      } else {
+        console.log("Admin user seeded: admin@smm.com / adminpassword");
+      }
     }
   } catch (err: any) {
-    console.error("Seeding failed (this is expected if DB is read-only):", err.message);
+    console.error("Seeding check failed:", err.message);
   }
 }
 
@@ -116,13 +55,17 @@ app.use(cors());
 app.use(express.json());
 
 async function startServer() {
-  initDb();
-  await seedUsers();
+  await seedAdmin();
   const PORT = 3000;
 
   // --- Health Check ---
-  app.get("/api/health", (req, res) => {
-    res.json({ status: "ok", env: process.env.NODE_ENV, vercel: !!process.env.VERCEL });
+  app.get("/api/health", async (req, res) => {
+    let supabaseStatus = "disconnected";
+    if (SUPABASE_URL) {
+      const { error } = await supabase.from("users").select("id").limit(1);
+      supabaseStatus = error ? `error: ${error.message}` : "connected";
+    }
+    res.json({ status: "ok", supabase: supabaseStatus });
   });
 
   // --- Auth Routes ---
@@ -131,22 +74,33 @@ async function startServer() {
     const { username, email, password } = req.body;
     try {
       const hashedPassword = await bcrypt.hash(password, 10);
-      const info = db.prepare("INSERT INTO users (username, email, password) VALUES (?, ?, ?)")
-        .run(username, email, hashedPassword);
-      const user = db.prepare("SELECT id, username, email, balance, role FROM users WHERE id = ?").get(info.lastInsertRowid) as any;
+      const { data: user, error } = await supabase
+        .from("users")
+        .insert([{ username, email, password: hashedPassword, balance: 0, role: 'user' }])
+        .select("id, username, email, balance, role")
+        .single();
+
+      if (error) throw error;
+
       const token = jwt.sign({ id: user.id, role: user.role }, JWT_SECRET);
       res.json({ user, token });
     } catch (err: any) {
-      res.status(400).json({ error: "Username or email already exists" });
+      res.status(400).json({ error: err.message || "Username or email already exists" });
     }
   });
 
   app.post("/api/auth/login", async (req, res) => {
     const { email, password } = req.body;
-    const user = db.prepare("SELECT * FROM users WHERE email = ?").get(email) as any;
-    if (!user || !(await bcrypt.compare(password, user.password))) {
+    const { data: user, error } = await supabase
+      .from("users")
+      .select("*")
+      .eq("email", email)
+      .single();
+
+    if (error || !user || !(await bcrypt.compare(password, user.password))) {
       return res.status(401).json({ error: "Invalid credentials" });
     }
+
     const token = jwt.sign({ id: user.id, role: user.role }, JWT_SECRET);
     const { password: _, ...userWithoutPassword } = user;
     res.json({ user: userWithoutPassword, token });
@@ -165,81 +119,84 @@ async function startServer() {
     }
   };
 
-  app.get("/api/auth/me", authenticate, (req: any, res) => {
-    const user = db.prepare("SELECT id, username, email, balance, role FROM users WHERE id = ?").get(req.user.id);
+  app.get("/api/auth/me", authenticate, async (req: any, res) => {
+    const { data: user, error } = await supabase
+      .from("users")
+      .select("id, username, email, balance, role")
+      .eq("id", req.user.id)
+      .single();
+    
+    if (error) return res.status(404).json({ error: "User not found" });
     res.json(user);
   });
 
   // --- Orders ---
 
-  app.get("/api/orders", authenticate, (req: any, res) => {
-    const orders = db.prepare(`
-      SELECT o.*, s.name as service_name 
-      FROM orders o 
-      JOIN services s ON o.service_id = s.id 
-      WHERE o.user_id = ? 
-      ORDER BY o.created_at DESC
-    `).all(req.user.id);
-    res.json(orders);
+  app.get("/api/orders", authenticate, async (req: any, res) => {
+    const { data: orders, error } = await supabase
+      .from("orders")
+      .select(`
+        *,
+        services (
+          name
+        )
+      `)
+      .eq("user_id", req.user.id)
+      .order("created_at", { ascending: false });
+
+    if (error) return res.status(500).json({ error: error.message });
+    
+    // Flatten the service name
+    const formattedOrders = orders.map((o: any) => ({
+      ...o,
+      service_name: o.services?.name
+    }));
+
+    res.json(formattedOrders);
   });
 
   app.post("/api/orders", authenticate, async (req: any, res) => {
     const { service_id, link, quantity } = req.body;
-    const service = db.prepare(`
-      SELECT s.*, p.url as provider_url, p.api_key as provider_key 
-      FROM services s 
-      JOIN providers p ON s.provider_id = p.id 
-      WHERE s.id = ?
-    `).get(service_id) as any;
+    
+    const { data: service, error: sError } = await supabase
+      .from("services")
+      .select(`
+        *,
+        providers (
+          url,
+          api_key
+        )
+      `)
+      .eq("id", service_id)
+      .single();
 
-    if (!service) return res.status(404).json({ error: "Service not found" });
+    if (sError || !service) return res.status(404).json({ error: "Service not found" });
     
     const charge = (service.selling_price * quantity) / 1000;
-    const user = db.prepare("SELECT balance FROM users WHERE id = ?").get(req.user.id) as any;
+    
+    const { data: user, error: uError } = await supabase
+      .from("users")
+      .select("balance")
+      .eq("id", req.user.id)
+      .single();
 
-    if (user.balance < charge) {
+    if (uError || user.balance < charge) {
       return res.status(400).json({ error: "Insufficient balance" });
     }
 
     try {
       // Call Provider API
-      // Try standard parameters first
       const standardParams = new URLSearchParams({
-        key: service.provider_key,
+        key: service.providers.api_key,
         action: "add",
         service: service.service_id,
         link: link,
         quantity: quantity.toString()
       });
 
-      // Try mastpanel.online style parameters as fallback
-      const mastpanelParams = new URLSearchParams({
-        apiKey: service.provider_key,
-        actionType: "add",
-        orderType: service.service_id,
-        orderUrl: link,
-        orderQuantity: quantity.toString()
+      const providerResp = await axios.post(service.providers.url, standardParams.toString(), {
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
       });
-
-      let providerResp;
-      try {
-        providerResp = await axios.post(service.provider_url, standardParams.toString(), {
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
-        });
-        
-        // If standard fails with an error that looks like parameter mismatch, try mastpanel
-        if (providerResp.data.error && (
-          providerResp.data.error.toLowerCase().includes("key") || 
-          providerResp.data.error.toLowerCase().includes("action") ||
-          providerResp.data.error.toLowerCase().includes("service")
-        )) {
-          throw new Error("TRY_MASTPANEL");
-        }
-      } catch (err) {
-        providerResp = await axios.post(service.provider_url, mastpanelParams.toString(), {
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
-        });
-      }
 
       if (providerResp.data.error) {
         return res.status(400).json({ error: `Provider Error: ${providerResp.data.error}` });
@@ -248,85 +205,78 @@ async function startServer() {
       const providerOrderId = providerResp.data.order || providerResp.data.orderID;
 
       // Deduct balance and create order
-      db.transaction(() => {
-        db.prepare("UPDATE users SET balance = balance - ? WHERE id = ?").run(charge, req.user.id);
-        db.prepare("INSERT INTO orders (user_id, service_id, provider_order_id, link, quantity, charge) VALUES (?, ?, ?, ?, ?, ?)")
-          .run(req.user.id, service_id, providerOrderId, link, quantity, charge);
-        db.prepare("INSERT INTO transactions (user_id, amount, type, description) VALUES (?, ?, ?, ?)")
-          .run(req.user.id, -charge, 'order', `Order for ${service.name}`);
-      })();
+      const { error: tError } = await supabase.rpc('place_order', {
+        p_user_id: req.user.id,
+        p_service_id: service_id,
+        p_provider_order_id: providerOrderId.toString(),
+        p_link: link,
+        p_quantity: quantity,
+        p_charge: charge,
+        p_description: `Order for ${service.name}`
+      });
+
+      if (tError) throw tError;
 
       res.json({ success: true, orderId: providerOrderId });
     } catch (err: any) {
       console.error("Order placement failed:", err.message);
-      res.status(500).json({ error: "Failed to place order with provider" });
+      res.status(500).json({ error: "Failed to place order with provider: " + err.message });
     }
   });
 
   // --- Balance / Deposits ---
 
-  app.post("/api/deposit", authenticate, (req: any, res) => {
+  app.post("/api/deposit", authenticate, async (req: any, res) => {
     const { amount } = req.body;
     if (amount <= 0) return res.status(400).json({ error: "Invalid amount" });
 
-    db.transaction(() => {
-      db.prepare("UPDATE users SET balance = balance + ? WHERE id = ?").run(amount, req.user.id);
-      db.prepare("INSERT INTO transactions (user_id, amount, type, description) VALUES (?, ?, ?, ?)")
-        .run(req.user.id, amount, 'deposit', 'Manual deposit');
-    })();
+    const { data: user, error } = await supabase.rpc('add_deposit', {
+      p_user_id: req.user.id,
+      p_amount: amount,
+      p_description: 'Manual deposit'
+    });
 
-    const user = db.prepare("SELECT balance FROM users WHERE id = ?").get(req.user.id);
+    if (error) return res.status(500).json({ error: error.message });
     res.json(user);
   });
 
   // Sync Order Statuses
   app.post("/api/orders/sync", authenticate, async (req: any, res) => {
-    const pendingOrders = db.prepare(`
-      SELECT o.*, p.url as provider_url, p.api_key as provider_key 
-      FROM orders o 
-      JOIN services s ON o.service_id = s.id 
-      JOIN providers p ON s.provider_id = p.id 
-      WHERE o.status IN ('pending', 'processing', 'inprogress')
-    `).all() as any[];
+    const { data: pendingOrders, error } = await supabase
+      .from("orders")
+      .select(`
+        *,
+        services (
+          providers (
+            url,
+            api_key
+          )
+        )
+      `)
+      .in("status", ['pending', 'processing', 'inprogress']);
+
+    if (error) return res.status(500).json({ error: error.message });
 
     let updatedCount = 0;
 
     for (const order of pendingOrders) {
       try {
-        // Try standard status check
-        const standardParams = new URLSearchParams({
-          key: order.provider_key,
+        const params = new URLSearchParams({
+          key: order.services.providers.api_key,
           action: "status",
           order: order.provider_order_id
         });
 
-        // Try mastpanel style status check
-        const mastpanelParams = new URLSearchParams({
-          apiKey: order.provider_key,
-          actionType: "status",
-          orderID: order.provider_order_id
+        const statusResp = await axios.post(order.services.providers.url, params.toString(), {
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
         });
-
-        let statusResp;
-        try {
-          statusResp = await axios.post(order.provider_url, standardParams.toString(), {
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
-          });
-          if (statusResp.data.error) throw new Error("TRY_MASTPANEL");
-        } catch (err) {
-          statusResp = await axios.post(order.provider_url, mastpanelParams.toString(), {
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
-          });
-        }
 
         if (statusResp.data && statusResp.data.status) {
           const newStatus = statusResp.data.status.toLowerCase();
-          db.prepare("UPDATE orders SET status = ? WHERE id = ?").run(newStatus, order.id);
-          updatedCount++;
-        } else if (statusResp.data && statusResp.data.orderStatus) {
-          // MastPanel uses orderStatus
-          const newStatus = statusResp.data.orderStatus.toLowerCase();
-          db.prepare("UPDATE orders SET status = ? WHERE id = ?").run(newStatus, order.id);
+          await supabase
+            .from("orders")
+            .update({ status: newStatus })
+            .eq("id", order.id);
           updatedCount++;
         }
       } catch (err: any) {
@@ -338,295 +288,131 @@ async function startServer() {
   });
 
   // --- Providers ---
-  app.get("/api/providers", (req, res) => {
-    const providers = db.prepare("SELECT * FROM providers").all();
+  app.get("/api/providers", authenticate, async (req, res) => {
+    const { data: providers, error } = await supabase.from("providers").select("*");
+    if (error) return res.status(500).json({ error: error.message });
     res.json(providers);
   });
 
-  app.post("/api/providers", (req, res) => {
+  app.post("/api/providers", authenticate, async (req, res) => {
     const { name, url, api_key, margin } = req.body;
-    const info = db.prepare("INSERT INTO providers (name, url, api_key, margin) VALUES (?, ?, ?, ?)")
-      .run(name, url, api_key, parseFloat(margin) || 0);
-    res.json({ id: info.lastInsertRowid });
+    const { data, error } = await supabase
+      .from("providers")
+      .insert([{ name, url, api_key, margin: parseFloat(margin) || 0 }])
+      .select("id")
+      .single();
+    
+    if (error) return res.status(500).json({ error: error.message });
+    res.json(data);
   });
 
-  app.delete("/api/providers/:id", (req, res) => {
-    db.prepare("DELETE FROM services WHERE provider_id = ?").run(req.params.id);
-    db.prepare("DELETE FROM providers WHERE id = ?").run(req.params.id);
+  app.delete("/api/providers/:id", authenticate, async (req, res) => {
+    // Supabase should handle cascading deletes if configured, or we do it manually
+    await supabase.from("services").delete().eq("provider_id", req.params.id);
+    const { error } = await supabase.from("providers").delete().eq("id", req.params.id);
+    
+    if (error) return res.status(500).json({ error: error.message });
     res.json({ success: true });
   });
 
   // Import Services
   app.post("/api/import/:providerId", async (req, res) => {
     try {
-      const provider = db.prepare("SELECT * FROM providers WHERE id = ?").get(req.params.providerId) as any;
-      if (!provider) return res.status(404).json({ error: "Provider not found" });
+      const { data: provider, error: pError } = await supabase
+        .from("providers")
+        .select("*")
+        .eq("id", req.params.providerId)
+        .single();
 
-      console.log(`Attempting import from: ${provider.url}`);
+      if (pError || !provider) return res.status(404).json({ error: "Provider not found" });
 
-      let response;
-      const requestConfig = {
-        headers: { 
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        },
-        timeout: 25000,
-        maxRedirects: 5
-      };
+      const params = new URLSearchParams({
+        key: provider.api_key,
+        action: "services"
+      });
 
-      const tryRequest = async (url: string, method: 'POST' | 'GET', useJson = false) => {
-        const standardParams = {
-          key: provider.api_key,
-          action: "services"
-        };
-        
-        const mastpanelParams = {
-          apiKey: provider.api_key,
-          actionType: "services"
-        };
-
-        const execute = async (params: any) => {
-          if (method === 'POST') {
-            if (useJson) {
-              return await axios.post(url, params, {
-                ...requestConfig,
-                headers: { ...requestConfig.headers, 'Content-Type': 'application/json' }
-              });
-            } else {
-              const formData = new URLSearchParams(params);
-              return await axios.post(url, formData.toString(), {
-                ...requestConfig,
-                headers: { ...requestConfig.headers, 'Content-Type': 'application/x-www-form-urlencoded' }
-              });
-            }
-          } else {
-            const query = new URLSearchParams(params).toString();
-            const separator = url.includes('?') ? '&' : '?';
-            return await axios.get(`${url}${separator}${query}`, requestConfig);
-          }
-        };
-
-        let resp = await execute(standardParams);
-        
-        // If standard fails with an error that looks like parameter mismatch, try mastpanel
-        if (resp.data && typeof resp.data === 'object' && resp.data.error && (
-          resp.data.error.toLowerCase().includes("key") || 
-          resp.data.error.toLowerCase().includes("action")
-        )) {
-          resp = await execute(mastpanelParams);
-        }
-        
-        // If it's an empty array or doesn't look like services, try mastpanel anyway
-        if (Array.isArray(resp.data) && resp.data.length === 0) {
-           const altResp = await execute(mastpanelParams);
-           if (Array.isArray(altResp.data) && altResp.data.length > 0) return altResp;
-        }
-
-        return resp;
-      };
-
-      const runAllAttempts = async (url: string) => {
-        let lastResp;
-        try {
-          console.log(`Attempt 1: Standard POST to ${url}`);
-          lastResp = await tryRequest(url, 'POST');
-          if (lastResp.data && typeof lastResp.data === 'object' && lastResp.data.error) {
-            const errText = lastResp.data.error.toLowerCase();
-            if (errText.includes("action") || errText.includes("key")) throw new Error("TRY_NEXT");
-          }
-          return lastResp;
-        } catch (err) {
-          try {
-            console.log(`Attempt 2: GET to ${url}`);
-            lastResp = await tryRequest(url, 'GET');
-            if (lastResp.data && typeof lastResp.data === 'object' && lastResp.data.error) {
-              const errText = lastResp.data.error.toLowerCase();
-              if (errText.includes("action") || errText.includes("key")) throw new Error("TRY_NEXT");
-            }
-            return lastResp;
-          } catch (err2) {
-            console.log(`Attempt 3: JSON POST to ${url}`);
-            return await tryRequest(url, 'POST', true);
-          }
-        }
-      };
-
-      try {
-        response = await runAllAttempts(provider.url);
-        
-        // If we got HTML, maybe the URL is missing /v2
-        const data = response.data;
-        if (typeof data === 'string' && (data.trim().startsWith('<!DOCTYPE') || data.trim().startsWith('<html'))) {
-          if (!provider.url.toLowerCase().endsWith('/v2') && !provider.url.toLowerCase().endsWith('/v1')) {
-            console.log("Got HTML, trying with /v2 suffix...");
-            const baseUrl = provider.url.endsWith('/') ? provider.url.slice(0, -1) : provider.url;
-            const v2Url = `${baseUrl}/v2`;
-            const v2Response = await runAllAttempts(v2Url);
-            
-            // If v2 worked and returned JSON, use it!
-            const v2Data = v2Response.data;
-            if (v2Data && (typeof v2Data === 'object' || (typeof v2Data === 'string' && !v2Data.trim().startsWith('<html')))) {
-              console.log("v2 URL worked!");
-              response = v2Response;
-            }
-          }
-        }
-      } catch (err: any) {
-        console.error("All import attempts failed:", err.message);
-        throw err;
-      }
+      const response = await axios.post(provider.url, params.toString(), {
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+      });
 
       let services = response.data;
-      
-      // Log the type and a snippet of the response for debugging
-      console.log(`Response type: ${typeof services}`);
-      if (services && typeof services === 'object') {
-        const snippet = JSON.stringify(services).substring(0, 200);
-        console.log(`Response snippet: ${snippet}...`);
-      }
-
-      // Handle cases where the response is a string that needs parsing
-      if (typeof services === 'string') {
-        const trimmed = services.trim();
-        console.log(`Response string snippet: ${trimmed.substring(0, 200)}`);
-        
-        if (trimmed.startsWith('<!DOCTYPE') || trimmed.startsWith('<html')) {
-          // Try to extract title for better error message
-          const titleMatch = trimmed.match(/<title>(.*?)<\/title>/i);
-          const title = titleMatch ? titleMatch[1] : 'Unknown Page';
-          
-          let suggestion = "Please check if your API URL is correct (e.g., ends with /api/v2).";
-          if (title.includes("Cloudflare")) {
-            suggestion = "The provider is protected by Cloudflare and is blocking the automated request.";
-          } else if (title.includes("404")) {
-            suggestion = "The API endpoint was not found. Try adding /v2 or /v1 to your URL.";
-          }
-
-          return res.status(400).json({ 
-            error: `API returned an HTML page ("${title}") instead of data. ${suggestion}` 
-          });
-        }
-
-        try {
-          services = JSON.parse(trimmed);
-        } catch (e) {
-          return res.status(400).json({ 
-            error: `API returned invalid JSON. First 50 chars: ${trimmed.substring(0, 50)}` 
-          });
-        }
-      }
-
-      if (services && typeof services === 'object' && !Array.isArray(services)) {
-        if (services.error) {
-          return res.status(400).json({ error: `Provider API Error: ${services.error}` });
-        }
-        // Check for common nested keys
-        const possibleKeys = ['services', 'data', 'items'];
-        for (const key of possibleKeys) {
-          if (services[key] && Array.isArray(services[key])) {
-            return processServices(services[key], provider, res);
-          }
-        }
-        
-        // If it's an object and none of the keys worked, maybe the object itself contains services as values
-        const values = Object.values(services);
-        if (values.length > 0 && typeof values[0] === 'object' && (values[0] as any).service_id) {
-          return processServices(values, provider, res);
-        }
-
-        return res.status(400).json({ error: "Invalid API response format (expected array or nested services array)" });
-      }
-
       if (!Array.isArray(services)) {
-        return res.status(400).json({ error: "Invalid API response from provider (not an array)" });
+        return res.status(400).json({ error: "Invalid API response from provider" });
       }
 
-      return processServices(services, provider, res);
-    } catch (error: any) {
-      console.error("Import error details:", error.message);
-      if (error.response) {
-        console.error("Response data:", error.response.data);
-        console.error("Response status:", error.response.status);
+      // Clear existing services for this provider
+      await supabase.from("services").delete().eq("provider_id", provider.id);
+
+      let importedCount = 0;
+      for (const s of services) {
+        const serviceId = s.service || s.id;
+        const name = s.name || s.title;
+        const category = s.category || "Uncategorized";
+        const rate = s.rate || s.price;
+
+        if (!serviceId || !name || !rate) continue;
+
+        // Ensure category exists
+        const { data: catData, error: cError } = await supabase
+          .from("categories")
+          .upsert({ name: category }, { onConflict: 'name' })
+          .select("id")
+          .single();
+
+        if (cError) continue;
+
+        const sellingPrice = parseFloat(rate) * (1 + provider.margin / 100);
+        
+        await supabase.from("services").insert([{
+          service_id: serviceId.toString(),
+          provider_id: provider.id,
+          name,
+          category_id: catData.id,
+          provider_rate: parseFloat(rate),
+          selling_price: sellingPrice,
+          min: parseInt(s.min) || 0,
+          max: parseInt(s.max) || 0
+        }]);
+        importedCount++;
       }
-      const errorMsg = error.response?.data?.error || error.message;
-      res.status(500).json({ error: "Failed to import services: " + errorMsg });
+
+      await supabase
+        .from("providers")
+        .update({ last_import: new Date().toISOString() })
+        .eq("id", provider.id);
+
+      res.json({ success: true, count: importedCount });
+    } catch (error: any) {
+      res.status(500).json({ error: "Failed to import services: " + error.message });
     }
   });
 
-  function processServices(servicesList: any[], provider: any, res: any) {
-    try {
-      console.log(`Processing ${servicesList.length} services...`);
-      
-      // Clear existing services for this provider
-      db.prepare("DELETE FROM services WHERE provider_id = ?").run(provider.id);
-
-      const insertCategory = db.prepare("INSERT OR IGNORE INTO categories (name) VALUES (?)");
-      const getCategory = db.prepare("SELECT id FROM categories WHERE name = ?");
-      const insertService = db.prepare(`
-        INSERT INTO services (service_id, provider_id, name, category_id, provider_rate, selling_price, min, max)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      `);
-
-      let importedCount = 0;
-      const transaction = db.transaction((list) => {
-        for (const s of list) {
-          // Be more flexible with property names
-          const serviceId = s.service || s.id || s.service_id;
-          const name = s.name || s.title;
-          const category = s.category || s.group || "Uncategorized";
-          const rate = s.rate || s.price || s.cost;
-
-          if (!serviceId || !name || !rate) {
-            console.log("Skipping invalid service item:", JSON.stringify(s).substring(0, 100));
-            continue;
-          }
-
-          insertCategory.run(category);
-          const cat = getCategory.get(category) as any;
-          
-          // Handle rates that might have commas or other formatting
-          const rateStr = rate.toString().replace(/,/g, '');
-          const rateNum = parseFloat(rateStr) || 0;
-          const sellingPrice = rateNum * (1 + provider.margin / 100);
-          
-          insertService.run(
-            serviceId.toString(),
-            provider.id,
-            name,
-            cat.id,
-            rateNum,
-            sellingPrice,
-            parseInt(s.min) || 0,
-            parseInt(s.max) || 0
-          );
-          importedCount++;
-        }
-      });
-
-      transaction(servicesList);
-      
-      // Update last_import timestamp
-      db.prepare("UPDATE providers SET last_import = ? WHERE id = ?").run(new Date().toISOString(), provider.id);
-      
-      console.log(`Successfully imported ${importedCount} services.`);
-      res.json({ success: true, count: importedCount });
-    } catch (err: any) {
-      console.error("Database error during import:", err.message);
-      res.status(500).json({ error: "Database error during import: " + err.message });
-    }
-  }
-
   // Get Services Grouped by Category
-  app.get("/api/services", (req, res) => {
-    const categories = db.prepare("SELECT * FROM categories ORDER BY name ASC").all() as any[];
-    const result = categories.map(cat => {
-      const services = db.prepare(`
-        SELECT s.*, p.name as provider_name 
-        FROM services s 
-        JOIN providers p ON s.provider_id = p.id 
-        WHERE s.category_id = ?
-      `).all(cat.id);
-      return { ...cat, services };
-    }).filter(cat => cat.services.length > 0);
+  app.get("/api/services", async (req, res) => {
+    const { data: categories, error: cError } = await supabase
+      .from("categories")
+      .select(`
+        *,
+        services (
+          *,
+          providers (
+            name
+          )
+        )
+      `)
+      .order("name");
+
+    if (cError) return res.status(500).json({ error: cError.message });
+    
+    const result = categories
+      .map((cat: any) => ({
+        ...cat,
+        services: cat.services.map((s: any) => ({
+          ...s,
+          provider_name: s.providers?.name
+        }))
+      }))
+      .filter((cat: any) => cat.services.length > 0);
     
     res.json(result);
   });
@@ -639,8 +425,6 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    // In Vercel, static files are handled by vercel.json
-    // But we keep this for other production environments
     const distPath = path.join(process.cwd(), "dist");
     app.use(express.static(distPath));
     app.get("*", (req, res) => {
