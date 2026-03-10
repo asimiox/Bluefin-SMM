@@ -177,10 +177,11 @@ export default function App() {
       if (res.ok) {
         login(data.user, data.token);
       } else {
-        setAuthError(data.error);
+        setAuthError(data.error || 'Authentication failed');
       }
     } catch (err) {
-      setAuthError('Connection failed');
+      console.error("Auth error:", err);
+      setAuthError('Connection failed. Please check if the server is running and Supabase keys are set.');
     }
   };
 

@@ -13,11 +13,35 @@ const SUPABASE_URL = process.env.SUPABASE_URL || "";
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
 const JWT_SECRET = process.env.JWT_SECRET || "smm-secret-key-123";
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+let supabaseClient: any = null;
+
+function getSupabase() {
+  if (supabaseClient) return supabaseClient;
+  
+  const url = process.env.SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  
+  if (!url || !key) {
+    console.error("CRITICAL: SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY is missing!");
+    return null;
+  }
+  
+  try {
+    supabaseClient = createClient(url, key);
+    return supabaseClient;
+  } catch (err: any) {
+    console.error("Failed to initialize Supabase client:", err.message);
+    return null;
+  }
+}
 
 // Seed default admin user
 async function seedAdmin() {
-  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) return;
+  const supabase = getSupabase();
+  if (!supabase) {
+    console.log("Skipping admin seeding: Supabase not initialized.");
+    return;
+  }
   
   try {
     const { data: admin, error } = await supabase
@@ -61,17 +85,36 @@ async function startServer() {
 
   // --- Health Check ---
   app.get("/api/health", async (req, res) => {
+    const supabase = getSupabase();
     let supabaseStatus = "disconnected";
-    if (SUPABASE_URL) {
-      const { error } = await supabase.from("users").select("id").limit(1);
-      supabaseStatus = error ? `error: ${error.message}` : "connected";
+    
+    if (supabase) {
+      try {
+        const { error } = await supabase.from("users").select("id").limit(1);
+        supabaseStatus = error ? `error: ${error.message}` : "connected";
+      } catch (err: any) {
+        supabaseStatus = `exception: ${err.message}`;
+      }
+    } else {
+      supabaseStatus = "missing_config";
     }
-    res.json({ status: "ok", supabase: supabaseStatus });
+    
+    res.json({ 
+      status: "ok", 
+      supabase: supabaseStatus,
+      env: {
+        hasUrl: !!process.env.SUPABASE_URL,
+        hasKey: !!process.env.SUPABASE_SERVICE_ROLE_KEY
+      }
+    });
   });
 
   // --- Auth Routes ---
 
   app.post("/api/auth/register", async (req, res) => {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: "Database not configured" });
+    
     const { username, email, password } = req.body;
     try {
       const hashedPassword = await bcrypt.hash(password, 10);
@@ -81,16 +124,22 @@ async function startServer() {
         .select("id, username, email, balance, role")
         .single();
 
-      if (error) throw error;
+      if (error) {
+        console.error("Registration error:", error.message);
+        throw error;
+      }
 
       const token = jwt.sign({ id: user.id, role: user.role }, JWT_SECRET);
       res.json({ user, token });
     } catch (err: any) {
-      res.status(400).json({ error: err.message || "Username or email already exists" });
+      res.status(400).json({ error: err.message || "Registration failed" });
     }
   });
 
   app.post("/api/auth/login", async (req, res) => {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: "Database not configured" });
+
     const { email, password } = req.body;
     const { data: user, error } = await supabase
       .from("users")
@@ -98,7 +147,15 @@ async function startServer() {
       .eq("email", email)
       .single();
 
-    if (error || !user || !(await bcrypt.compare(password, user.password))) {
+    if (error) {
+      console.error("Login query error:", error.message);
+      if (error.code === 'PGRST116') { // Not found
+        return res.status(401).json({ error: "Invalid credentials" });
+      }
+      return res.status(500).json({ error: `Database error: ${error.message}` });
+    }
+
+    if (!user || !(await bcrypt.compare(password, user.password))) {
       return res.status(401).json({ error: "Invalid credentials" });
     }
 
@@ -121,6 +178,9 @@ async function startServer() {
   };
 
   app.get("/api/auth/me", authenticate, async (req: any, res) => {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: "Database not configured" });
+
     const { data: user, error } = await supabase
       .from("users")
       .select("id, username, email, balance, role")
@@ -134,6 +194,9 @@ async function startServer() {
   // --- Orders ---
 
   app.get("/api/orders", authenticate, async (req: any, res) => {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: "Database not configured" });
+
     const { data: orders, error } = await supabase
       .from("orders")
       .select(`
@@ -157,6 +220,9 @@ async function startServer() {
   });
 
   app.post("/api/orders", authenticate, async (req: any, res) => {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: "Database not configured" });
+
     const { service_id, link, quantity } = req.body;
     
     const { data: service, error: sError } = await supabase
@@ -228,6 +294,9 @@ async function startServer() {
   // --- Balance / Deposits ---
 
   app.post("/api/deposit", authenticate, async (req: any, res) => {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: "Database not configured" });
+
     const { amount } = req.body;
     if (amount <= 0) return res.status(400).json({ error: "Invalid amount" });
 
@@ -243,6 +312,9 @@ async function startServer() {
 
   // Sync Order Statuses
   app.post("/api/orders/sync", authenticate, async (req: any, res) => {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: "Database not configured" });
+
     const { data: pendingOrders, error } = await supabase
       .from("orders")
       .select(`
@@ -290,12 +362,18 @@ async function startServer() {
 
   // --- Providers ---
   app.get("/api/providers", authenticate, async (req, res) => {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: "Database not configured" });
+
     const { data: providers, error } = await supabase.from("providers").select("*");
     if (error) return res.status(500).json({ error: error.message });
     res.json(providers);
   });
 
   app.post("/api/providers", authenticate, async (req, res) => {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: "Database not configured" });
+
     const { name, url, api_key, margin } = req.body;
     const { data, error } = await supabase
       .from("providers")
@@ -308,6 +386,9 @@ async function startServer() {
   });
 
   app.delete("/api/providers/:id", authenticate, async (req, res) => {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: "Database not configured" });
+
     // Supabase should handle cascading deletes if configured, or we do it manually
     await supabase.from("services").delete().eq("provider_id", req.params.id);
     const { error } = await supabase.from("providers").delete().eq("id", req.params.id);
@@ -318,6 +399,9 @@ async function startServer() {
 
   // Import Services
   app.post("/api/import/:providerId", async (req, res) => {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: "Database not configured" });
+
     try {
       const { data: provider, error: pError } = await supabase
         .from("providers")
@@ -390,6 +474,9 @@ async function startServer() {
 
   // Get Services Grouped by Category
   app.get("/api/services", async (req, res) => {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: "Database not configured" });
+
     const { data: categories, error: cError } = await supabase
       .from("categories")
       .select(`
