@@ -7,6 +7,7 @@ import axios from "axios";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import { createClient } from "@supabase/supabase-js";
+import fs from "fs";
 
 const SUPABASE_URL = process.env.SUPABASE_URL || "";
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
@@ -56,7 +57,7 @@ app.use(express.json());
 
 async function startServer() {
   await seedAdmin();
-  const PORT = 3000;
+  const PORT = process.env.PORT || 3000;
 
   // --- Health Check ---
   app.get("/api/health", async (req, res) => {
@@ -417,20 +418,19 @@ async function startServer() {
     res.json(result);
   });
 
-  // Vite middleware for development
-  if (process.env.NODE_ENV !== "production") {
+  // --- Production Serving ---
+  // On Vercel, static files are served by the platform.
+  // We only use Vite middleware for LOCAL development.
+  const isVercel = !!process.env.VERCEL;
+  const isProduction = process.env.NODE_ENV === "production" || isVercel;
+
+  if (!isProduction) {
+    console.log("Starting in DEVELOPMENT mode (Vite middleware)...");
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: "spa",
     });
     app.use(vite.middlewares);
-  } else {
-    const distPath = path.join(process.cwd(), "dist");
-    app.use(express.static(distPath));
-    app.get("*", (req, res) => {
-      if (req.path.startsWith('/api')) return;
-      res.sendFile(path.join(distPath, "index.html"));
-    });
   }
 
   // Error handler
@@ -439,8 +439,8 @@ async function startServer() {
     res.status(500).json({ error: "Internal Server Error", details: err.message });
   });
 
-  if (process.env.NODE_ENV !== 'production' || !process.env.VERCEL) {
-    app.listen(PORT, "0.0.0.0", () => {
+  if (!isVercel) {
+    app.listen(Number(PORT), "0.0.0.0", () => {
       console.log(`Server running on http://localhost:${PORT}`);
     });
   }
